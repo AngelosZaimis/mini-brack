@@ -1,0 +1,94 @@
+# CI quality gate for every PR and every push to main.
+# Actions are pinned by commit SHA (tag in the comment); Dependabot keeps them current.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: jobs only read the repo unless they explicitly ask for more.
+permissions:
+  contents: read
+
+# A new push to the same PR cancels the run still in progress; runs on main always finish.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Job name is referenced by the protect-main ruleset as a required check: don't rename.
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: 25
+
+      # Caches Gradle and validates gradle-wrapper.jar against known checksums.
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      # Compile (-Werror on main), tests incl. Testcontainers Postgres, spotlessCheck, bootJar.
+      - run: ./gradlew build
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-reports
+          path: '**/build/reports/tests/'
+          retention-days: 7
+
+  # Applied Flyway migrations are immutable (see CLAUDE.md). Tests run on an empty DB,
+  # so they can't notice an edited V*.sql; this diff check can.
+  migration-guard:
+    name: migration-guard
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fail if an existing migration was modified, renamed or deleted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          changed=$(git diff --name-only --diff-filter=MDR "$BASE_SHA"...HEAD -- ':(glob)**/db/migration/V*.sql')
+          if [ -n "$changed" ]; then
+            echo "::error::Applied migrations must not change. Add a new V<n>__*.sql instead:"
+            echo "$changed"
+            exit 1
+          fi
+          echo "No existing migrations touched."
+
+  # Sends the resolved Gradle dependency graph (incl. transitive deps) to GitHub,
+  # so Dependabot alerts cover everything. Needs write access, so main only.
+  dependency-submission:
+    name: dependency-submission
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - uses: gradle/actions/dependency-submission@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
